@@ -813,6 +813,26 @@ func classifyMediaPath(mediaPath string) (whatsmeow.MediaType, string, string) {
 		return whatsmeow.MediaVideo, "video/avi", "video"
 	case "mov":
 		return whatsmeow.MediaVideo, "video/quicktime", "video"
+	case "pdf":
+		return whatsmeow.MediaDocument, "application/pdf", "document"
+	case "doc":
+		return whatsmeow.MediaDocument, "application/msword", "document"
+	case "docx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "document"
+	case "xls":
+		return whatsmeow.MediaDocument, "application/vnd.ms-excel", "document"
+	case "xlsx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "document"
+	case "ppt":
+		return whatsmeow.MediaDocument, "application/vnd.ms-powerpoint", "document"
+	case "pptx":
+		return whatsmeow.MediaDocument, "application/vnd.openxmlformats-officedocument.presentationml.presentation", "document"
+	case "txt":
+		return whatsmeow.MediaDocument, "text/plain", "document"
+	case "csv":
+		return whatsmeow.MediaDocument, "text/csv", "document"
+	case "zip":
+		return whatsmeow.MediaDocument, "application/zip", "document"
 	default:
 		return whatsmeow.MediaDocument, "application/octet-stream", "document"
 	}
@@ -992,6 +1012,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 
 		mediaType, mimeType, _ := classifyMediaPath(mediaPath)
 
+		// Derive a clean display filename. Strip BOTH "/" and "\" so a Windows
+		// backslash path (e.g. D:\dir\file.docx) doesn't end up using the whole
+		// path as the document title (which renders like a file-path/link to the
+		// recipient instead of a clean attachment).
+		mediaName := mediaPath
+		if i := strings.LastIndexAny(mediaName, "/\\"); i >= 0 {
+			mediaName = mediaName[i+1:]
+		}
+
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
@@ -1056,7 +1085,8 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 			}
 		case whatsmeow.MediaDocument:
 			msg.DocumentMessage = &waProto.DocumentMessage{
-				Title:         proto.String(mediaPath[strings.LastIndex(mediaPath, "/")+1:]),
+				Title:         proto.String(mediaName),
+				FileName:      proto.String(mediaName),
 				Caption:       proto.String(message),
 				Mimetype:      proto.String(mimeType),
 				URL:           &resp.URL,
