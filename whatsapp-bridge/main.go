@@ -790,6 +790,14 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// SendPollRequest represents the request body for the send poll API.
+type SendPollRequest struct {
+	Recipient string   `json:"recipient"`
+	Question  string   `json:"question"`
+	Options   []string `json:"options"`
+	Multiple  bool     `json:"multiple"`
+}
+
 // classifyMediaPath maps a file extension to (whatsmeow upload type, MIME
 // type, persist-side category). Single source of truth for the upload path
 // (which needs the whatsmeow.MediaType + MIME) and the SQLite persist path
@@ -1168,6 +1176,56 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
+}
+
+func sendWhatsAppPoll(client *whatsmeow.Client, messageStore *MessageStore, recipient, question string, options []string, multiple bool) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	var recipientJID types.JID
+	var err error
+	if strings.Contains(recipient, "@") {
+		recipientJID, err = types.ParseJID(recipient)
+		if err != nil {
+			return false, fmt.Sprintf("Error parsing JID: %v", err)
+		}
+	} else {
+		recipientJID = types.NewJID(recipient, types.DefaultUserServer)
+	}
+	settingsLookupJID := recipientJID
+
+	if recipientJID.Server == types.DefaultUserServer {
+		ctx := context.Background()
+		lid, lidErr := client.Store.LIDs.GetLIDForPN(ctx, recipientJID)
+		if lidErr == nil && !lid.IsEmpty() {
+			recipientJID = lid
+		} else if info, infoErr := client.GetUserInfo(ctx, []types.JID{recipientJID}); infoErr == nil {
+			if userInfo, ok := info[recipientJID]; ok && !userInfo.LID.IsEmpty() {
+				recipientJID = userInfo.LID
+			}
+		}
+	}
+
+	selectableCount := 1
+	if multiple {
+		selectableCount = len(options)
+	}
+	msg := client.BuildPollCreation(question, options, selectableCount)
+
+	settings, err := messageStore.GetChatEphemeralSettings(resolveUserJID(client, settingsLookupJID, types.EmptyJID).String())
+	if err != nil && err != sql.ErrNoRows {
+		return false, fmt.Sprintf("Error loading chat settings: %v", err)
+	}
+	if err == nil {
+		applyChatEphemeralSettings(msg, settings)
+	}
+
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
+	if err != nil {
+		return false, fmt.Sprintf("Error sending poll: %v", err)
+	}
+	return true, fmt.Sprintf("Poll sent: %s", resp.ID)
 }
 
 // Extract quoted message info from ContextInfo
@@ -1775,6 +1833,40 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
+	})
+
+	http.HandleFunc("/api/poll", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req SendPollRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.Recipient == "" || strings.TrimSpace(req.Question) == "" {
+			http.Error(w, "Recipient and question are required", http.StatusBadRequest)
+			return
+		}
+		if len(req.Options) < 2 || len(req.Options) > 12 {
+			http.Error(w, "Polls require 2 to 12 options", http.StatusBadRequest)
+			return
+		}
+		for _, option := range req.Options {
+			if strings.TrimSpace(option) == "" {
+				http.Error(w, "Poll options cannot be empty", http.StatusBadRequest)
+				return
+			}
+		}
+
+		success, message := sendWhatsAppPoll(client, messageStore, req.Recipient, req.Question, req.Options, req.Multiple)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		_ = json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
 	// Handler for downloading media
