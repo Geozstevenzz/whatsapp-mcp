@@ -2010,6 +2010,112 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 	})
 
+	// Handler for creating a group
+	http.HandleFunc("/api/create_group", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			Name         string   `json:"name"`
+			Participants []string `json:"participants"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(req.Name) == "" {
+			http.Error(w, "Group name is required", http.StatusBadRequest)
+			return
+		}
+
+		participants := make([]types.JID, 0, len(req.Participants))
+		for _, p := range req.Participants {
+			var jid types.JID
+			var err error
+			if strings.Contains(p, "@") {
+				jid, err = types.ParseJID(p)
+				if err != nil {
+					http.Error(w, fmt.Sprintf("Invalid participant JID %q: %v", p, err), http.StatusBadRequest)
+					return
+				}
+			} else {
+				jid = types.NewJID(p, types.DefaultUserServer)
+			}
+			participants = append(participants, jid)
+		}
+
+		group, err := client.CreateGroup(context.Background(), whatsmeow.ReqCreateGroup{
+			Name:         req.Name,
+			Participants: participants,
+		})
+
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to create group: %v", err),
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": true,
+			"jid":     group.JID.String(),
+			"name":    group.Name,
+		})
+	})
+
+	// Handler for setting a group photo. photo_path must be a JPEG.
+	http.HandleFunc("/api/set_group_photo", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			GroupJID  string `json:"group_jid"`
+			PhotoPath string `json:"photo_path"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.GroupJID == "" || req.PhotoPath == "" {
+			http.Error(w, "group_jid and photo_path are required", http.StatusBadRequest)
+			return
+		}
+
+		jid, err := types.ParseJID(req.GroupJID)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid group JID: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		photo, err := os.ReadFile(req.PhotoPath)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to read photo: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		pictureID, err := client.SetGroupPhoto(context.Background(), jid, photo)
+
+		w.Header().Set("Content-Type", "application/json")
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to set group photo: %v", err),
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":    true,
+			"picture_id": pictureID,
+		})
+	})
+
 	// Start the server with proper timeouts. Bind to loopback so the bridge is
 	// not reachable from the LAN; MCP clients talk to it over localhost.
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
