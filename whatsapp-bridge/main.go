@@ -2377,15 +2377,12 @@ func main() {
 			}
 
 			// Print QR code for pairing with phone
-			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
-					if !qrCodeShown {
-						fmt.Println("\nScan this QR code with your WhatsApp app:")
-						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-						fmt.Println("\nWaiting for QR code scan...")
-						qrCodeShown = true
-					}
+					// Each code replaces the previous one when WhatsApp rotates it.
+					fmt.Println("\nScan this QR code with your WhatsApp app:")
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+					fmt.Println("\nWaiting for QR code scan...")
 				} else if evt.Event == "success" {
 					connected <- true
 					break
