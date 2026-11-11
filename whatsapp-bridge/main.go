@@ -337,10 +337,68 @@ func ensureColumn(db *sql.DB, tableName, columnName, columnSpec string) error {
 	return err
 }
 
+// attachWhatsAppDB pins one pooled connection and attaches whatsapp.db to it.
+// ATTACH is per connection and cannot be undone inside a transaction, so the
+// migrations attach on a dedicated connection and release() detaches before
+// returning it to the pool. Without the DETACH the pooled connection keeps
+// whatsapp.db open indefinitely (Windows then refuses to delete or replace
+// the file) and collects a new alias on every run.
+func (store *MessageStore) attachWhatsAppDB(ctx context.Context, whatsappDBPath, alias string) (*sql.Conn, func(), error) {
+	conn, err := store.db.Conn(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	escapedPath := strings.ReplaceAll(whatsappDBPath, "'", "''")
+	if _, err := conn.ExecContext(ctx, fmt.Sprintf("ATTACH DATABASE '%s' AS %s;", escapedPath, alias)); err != nil {
+		_ = conn.Close()
+		return nil, nil, err
+	}
+	release := func() {
+		// Background context: the detach must run even after cancellation.
+		_, _ = conn.ExecContext(context.Background(), fmt.Sprintf("DETACH DATABASE %s;", alias))
+		_ = conn.Close()
+	}
+	return conn, release, nil
+}
+
+// startLegacyNormalization runs the legacy LID chat and sender migrations in
+// one background goroutine so the REST API and QR pairing are not held back.
+// Each migration is a single short transaction (milliseconds to about a second
+// on a 230k-message store once idx_messages_chat_jid exists). Live handlers
+// writing concurrently wait on SQLite's lock through the driver's default 5s
+// busy timeout instead of failing. Rows that arrive during the run are already
+// stored in phone-JID form, so nothing is lost by running after startup.
+// Failures are logged and the bridge keeps running. Callers must call the
+// returned stop function before closing the store: it cancels any in-flight
+// statement (the transaction rolls back) and waits for the goroutine to exit.
+// done is closed when the goroutine exits.
+func (store *MessageStore) startLegacyNormalization(whatsappDBPath string, logger waLog.Logger) (stop func(), done <-chan struct{}) {
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		start := time.Now()
+		if err := store.MigrateLegacyLIDChatsToPhoneJIDs(ctx, whatsappDBPath, logger); err != nil {
+			logger.Errorf("Failed to migrate legacy LID chat rows: %v", err)
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if err := store.MigrateLegacyLIDSendersToPhones(ctx, whatsappDBPath, logger); err != nil {
+			logger.Errorf("Failed to migrate legacy LID sender rows: %v", err)
+		}
+		logger.Infof("Legacy LID normalization finished in %v", time.Since(start).Round(time.Millisecond))
+	}()
+	return func() {
+		cancel()
+		<-finished
+	}, finished
+}
+
 // MigrateLegacyLIDChatsToPhoneJIDs rewrites message/chat rows stored under
 // legacy @lid chat JIDs into phone-based @s.whatsapp.net chat JIDs using the
 // whatsmeow LID map in whatsapp.db.
-func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath string, logger waLog.Logger) error {
+func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(ctx context.Context, whatsappDBPath string, logger waLog.Logger) error {
 	if _, err := os.Stat(whatsappDBPath); err != nil {
 		if os.IsNotExist(err) {
 			logger.Infof("Skipping LID chat migration: %s not found", whatsappDBPath)
@@ -349,20 +407,21 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to stat WhatsApp DB %s: %w", whatsappDBPath, err)
 	}
 
-	tx, err := store.db.Begin()
+	alias := fmt.Sprintf("wa_mig_%d", time.Now().UnixNano())
+	conn, release, err := store.attachWhatsAppDB(ctx, whatsappDBPath, alias)
+	if err != nil {
+		return fmt.Errorf("failed to attach WhatsApp DB for LID chat migration: %w", err)
+	}
+	defer release()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start LID chat migration transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	alias := fmt.Sprintf("wa_mig_%d", time.Now().UnixNano())
-	escapedPath := strings.ReplaceAll(whatsappDBPath, "'", "''")
-	if _, err := tx.Exec(fmt.Sprintf("ATTACH DATABASE '%s' AS %s;", escapedPath, alias)); err != nil {
-		return fmt.Errorf("failed to attach WhatsApp DB for LID chat migration: %w", err)
-	}
-
 	var lidMapTableExists int
-	if err := tx.QueryRow(fmt.Sprintf(
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(
 		"SELECT COUNT(1) FROM %s.sqlite_master WHERE type='table' AND name='whatsmeow_lid_map';",
 		alias,
 	)).Scan(&lidMapTableExists); err != nil {
@@ -376,7 +435,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return nil
 	}
 
-	if _, err := tx.Exec(fmt.Sprintf(`
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TEMP TABLE tmp_lid_to_phone AS
 		SELECT DISTINCT
 			lm.lid || '@lid' AS lid_jid,
@@ -392,12 +451,12 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 
 	var mappedChats int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM tmp_lid_to_phone;").Scan(&mappedChats); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM tmp_lid_to_phone;").Scan(&mappedChats); err != nil {
 		return fmt.Errorf("failed to count mapped LID chats: %w", err)
 	}
 
 	if mappedChats == 0 {
-		if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_to_phone;"); err != nil {
+		if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_to_phone;"); err != nil {
 			return fmt.Errorf("failed to clean temporary LID mapping table: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -407,7 +466,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return nil
 	}
 
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		CREATE TEMP TABLE tmp_lid_chat_candidates AS
 		SELECT
 			m.phone_jid AS phone_jid,
@@ -428,7 +487,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to build temporary chat candidate table: %w", err)
 	}
 
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		CREATE TEMP TABLE tmp_lid_chat_meta AS
 		SELECT
 			c.phone_jid AS phone_jid,
@@ -454,7 +513,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to build temporary chat metadata table: %w", err)
 	}
 
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO chats (jid, name, last_message_time, last_read_time)
 		SELECT phone_jid, source_name, source_last_message_time, source_last_read_time
 		FROM tmp_lid_chat_meta;
@@ -462,7 +521,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to upsert destination chat rows: %w", err)
 	}
 
-	if _, err := tx.Exec(`
+	if _, err := tx.ExecContext(ctx, `
 		UPDATE chats
 		SET
 			name = CASE
@@ -522,7 +581,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 		return fmt.Errorf("failed to merge destination chat metadata: %w", err)
 	}
 
-	insertResult, err := tx.Exec(`
+	insertResult, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO messages (
 			id, chat_jid, sender, content, timestamp, is_from_me,
 			media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length
@@ -550,7 +609,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 
 	insertedMessages, _ := insertResult.RowsAffected()
 
-	deleteMessagesResult, err := tx.Exec(`
+	deleteMessagesResult, err := tx.ExecContext(ctx, `
 		DELETE FROM messages
 		WHERE chat_jid IN (SELECT lid_jid FROM tmp_lid_to_phone);
 	`)
@@ -559,7 +618,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 	deletedMessages, _ := deleteMessagesResult.RowsAffected()
 
-	deleteChatsResult, err := tx.Exec(`
+	deleteChatsResult, err := tx.ExecContext(ctx, `
 		DELETE FROM chats
 		WHERE jid IN (SELECT lid_jid FROM tmp_lid_to_phone);
 	`)
@@ -568,13 +627,13 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 	}
 	deletedChats, _ := deleteChatsResult.RowsAffected()
 
-	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_to_phone;"); err != nil {
+	if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_to_phone;"); err != nil {
 		return fmt.Errorf("failed to clean temporary LID mapping table: %w", err)
 	}
-	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_chat_meta;"); err != nil {
+	if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_chat_meta;"); err != nil {
 		return fmt.Errorf("failed to clean temporary chat metadata table: %w", err)
 	}
-	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_chat_candidates;"); err != nil {
+	if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_chat_candidates;"); err != nil {
 		return fmt.Errorf("failed to clean temporary chat candidate table: %w", err)
 	}
 
@@ -601,7 +660,7 @@ func (store *MessageStore) MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath strin
 //
 // The migration is idempotent: a second run finds no remaining LID-shaped
 // senders to rewrite. It is safe to run on every startup.
-func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string, logger waLog.Logger) error {
+func (store *MessageStore) MigrateLegacyLIDSendersToPhones(ctx context.Context, whatsappDBPath string, logger waLog.Logger) error {
 	if _, err := os.Stat(whatsappDBPath); err != nil {
 		if os.IsNotExist(err) {
 			logger.Infof("Skipping LID sender migration: %s not found", whatsappDBPath)
@@ -610,20 +669,21 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 		return fmt.Errorf("failed to stat WhatsApp DB %s: %w", whatsappDBPath, err)
 	}
 
-	tx, err := store.db.Begin()
+	alias := fmt.Sprintf("wa_sender_mig_%d", time.Now().UnixNano())
+	conn, release, err := store.attachWhatsAppDB(ctx, whatsappDBPath, alias)
+	if err != nil {
+		return fmt.Errorf("failed to attach WhatsApp DB for LID sender migration: %w", err)
+	}
+	defer release()
+
+	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to start LID sender migration transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	alias := fmt.Sprintf("wa_sender_mig_%d", time.Now().UnixNano())
-	escapedPath := strings.ReplaceAll(whatsappDBPath, "'", "''")
-	if _, err := tx.Exec(fmt.Sprintf("ATTACH DATABASE '%s' AS %s;", escapedPath, alias)); err != nil {
-		return fmt.Errorf("failed to attach WhatsApp DB for LID sender migration: %w", err)
-	}
-
 	var lidMapTableExists int
-	if err := tx.QueryRow(fmt.Sprintf(
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf(
 		"SELECT COUNT(1) FROM %s.sqlite_master WHERE type='table' AND name='whatsmeow_lid_map';",
 		alias,
 	)).Scan(&lidMapTableExists); err != nil {
@@ -638,26 +698,27 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 	}
 
 	// The sender column stores just the user-part (no @server suffix), so we
-	// match directly against whatsmeow_lid_map.lid. We pre-build a temp table
-	// scoped to senders that actually appear in our messages, both to avoid
-	// scanning the full LID map per row and to give us an accurate row count.
-	if _, err := tx.Exec(fmt.Sprintf(`
+	// match directly against whatsmeow_lid_map.lid. Distinct senders are
+	// collected in one pass over messages and joined on the LID map's primary
+	// key. There is no index on messages.sender, so a correlated EXISTS per
+	// LID map row would rescan messages once per mapped contact.
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		CREATE TEMP TABLE tmp_lid_sender_map AS
-		SELECT DISTINCT lm.lid AS lid_user, lm.pn AS phone_user
-		FROM %s.whatsmeow_lid_map lm
-		WHERE lm.lid != '' AND lm.pn != ''
-		  AND EXISTS (SELECT 1 FROM messages m WHERE m.sender = lm.lid);
+		SELECT lm.lid AS lid_user, lm.pn AS phone_user
+		FROM (SELECT DISTINCT sender FROM messages) s
+		JOIN %s.whatsmeow_lid_map lm ON lm.lid = s.sender
+		WHERE lm.lid != '' AND lm.pn != '';
 	`, alias)); err != nil {
 		return fmt.Errorf("failed to build temporary LID sender mapping table: %w", err)
 	}
 
 	var mappedSenders int
-	if err := tx.QueryRow("SELECT COUNT(*) FROM tmp_lid_sender_map;").Scan(&mappedSenders); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM tmp_lid_sender_map;").Scan(&mappedSenders); err != nil {
 		return fmt.Errorf("failed to count mapped LID senders: %w", err)
 	}
 
 	if mappedSenders == 0 {
-		if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_sender_map;"); err != nil {
+		if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_sender_map;"); err != nil {
 			return fmt.Errorf("failed to clean temporary LID sender mapping table: %w", err)
 		}
 		if err := tx.Commit(); err != nil {
@@ -667,7 +728,7 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 		return nil
 	}
 
-	updateResult, err := tx.Exec(`
+	updateResult, err := tx.ExecContext(ctx, `
 		UPDATE messages
 		SET sender = (
 			SELECT phone_user FROM tmp_lid_sender_map WHERE lid_user = messages.sender
@@ -679,7 +740,7 @@ func (store *MessageStore) MigrateLegacyLIDSendersToPhones(whatsappDBPath string
 	}
 	updatedRows, _ := updateResult.RowsAffected()
 
-	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_lid_sender_map;"); err != nil {
+	if _, err := tx.ExecContext(ctx, "DROP TABLE IF EXISTS tmp_lid_sender_map;"); err != nil {
 		return fmt.Errorf("failed to clean temporary LID sender mapping table: %w", err)
 	}
 
@@ -3104,15 +3165,10 @@ func main() {
 	}
 	defer func() { _ = messageStore.Close() }()
 
-	if err := messageStore.MigrateLegacyLIDChatsToPhoneJIDs("store/whatsapp.db", logger); err != nil {
-		logger.Errorf("Failed to migrate legacy LID chat rows: %v", err)
-		return
-	}
-
-	if err := messageStore.MigrateLegacyLIDSendersToPhones("store/whatsapp.db", logger); err != nil {
-		logger.Errorf("Failed to migrate legacy LID sender rows: %v", err)
-		return
-	}
+	// Deferred after Close, so it runs first: the store is never closed under
+	// a running migration.
+	stopNormalization, _ := messageStore.startLegacyNormalization(whatsmeowDBPath, logger)
+	defer stopNormalization()
 
 	// Resolve the REST API port. Pure env parsing with no dependency on the
 	// WhatsApp connection, so it's safe to do this early alongside the token

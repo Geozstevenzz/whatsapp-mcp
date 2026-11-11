@@ -1027,7 +1027,7 @@ func TestMigrateLegacyLIDSendersToPhones_RewritesAndIsIdempotent(t *testing.T) {
 		t.Fatalf("failed to seed message store: %v", err)
 	}
 
-	if err := ms.MigrateLegacyLIDSendersToPhones(whatsappDBPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDSendersToPhones(context.Background(), whatsappDBPath, logger); err != nil {
 		t.Fatalf("migration failed: %v", err)
 	}
 
@@ -1060,7 +1060,7 @@ func TestMigrateLegacyLIDSendersToPhones_RewritesAndIsIdempotent(t *testing.T) {
 		}
 	}
 
-	if err := ms.MigrateLegacyLIDSendersToPhones(whatsappDBPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDSendersToPhones(context.Background(), whatsappDBPath, logger); err != nil {
 		t.Fatalf("second run should be no-op, got error: %v", err)
 	}
 }
@@ -1070,7 +1070,7 @@ func TestMigrateLegacyLIDSendersToPhones_MissingWhatsAppDBIsNoOp(t *testing.T) {
 	logger := testLogger()
 
 	missingPath := filepath.Join(t.TempDir(), "missing-whatsapp.db")
-	if err := ms.MigrateLegacyLIDSendersToPhones(missingPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDSendersToPhones(context.Background(), missingPath, logger); err != nil {
 		t.Fatalf("expected missing whatsapp db to be a no-op, got error: %v", err)
 	}
 }
@@ -1328,7 +1328,7 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 		t.Fatalf("failed to seed message store: %v", err)
 	}
 
-	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(context.Background(), whatsappDBPath, logger); err != nil {
 		t.Fatalf("migration failed: %v", err)
 	}
 
@@ -1367,7 +1367,7 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MigratesAndIsIdempotent(t *testing.T) 
 		t.Fatalf("expected last_read_time merged to later LID marker, got %q", phoneRead)
 	}
 
-	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(context.Background(), whatsappDBPath, logger); err != nil {
 		t.Fatalf("second migration run should be a no-op, got error: %v", err)
 	}
 	if phoneCount := queryMessageCount(ms, phoneJID); phoneCount != 3 {
@@ -1380,7 +1380,7 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_MissingWhatsAppDBIsNoOp(t *testing.T) 
 	logger := testLogger()
 
 	missingPath := filepath.Join(t.TempDir(), "missing-whatsapp.db")
-	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(missingPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(context.Background(), missingPath, logger); err != nil {
 		t.Fatalf("expected missing whatsapp db to be treated as no-op, got error: %v", err)
 	}
 }
@@ -1685,7 +1685,7 @@ func TestMigrateLegacyLIDChatsToPhoneJIDs_AggregatesByPhoneJIDDeterministically(
 		t.Fatalf("failed to seed message store: %v", err)
 	}
 
-	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(whatsappDBPath, logger); err != nil {
+	if err := ms.MigrateLegacyLIDChatsToPhoneJIDs(context.Background(), whatsappDBPath, logger); err != nil {
 		t.Fatalf("migration failed: %v", err)
 	}
 
