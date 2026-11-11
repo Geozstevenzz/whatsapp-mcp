@@ -29,6 +29,34 @@ func TestPathHasPrefix(t *testing.T) {
 		{"/a/bbb", "/a/b", false}, // sibling-prefix attack
 		{"/a", "/a/b", false},     // shorter
 		{"", "/a", false},
+		{"/a", "", false},
+		{"/a/b" + sep + "c", "/a/b" + sep, true}, // root with trailing separator
+		{"/a/bbb", "/a/b" + sep, false},
+	}
+	if runtime.GOOS == "windows" {
+		cases = append(cases, []struct {
+			child, parent string
+			want          bool
+		}{
+			{`D:\folder\a.pdf`, `D:\`, true},
+			{`D:\a.pdf`, `D:\`, true},
+			{`C:\Users\x\a.pdf`, `D:\`, false},
+			{`C:\Users\LEVIATHAN\Desktop\a.pdf`, `C:\Users\LEVIATHAN`, true},
+			{`c:\users\leviathan\a.pdf`, `C:\Users\LEVIATHAN`, true}, // case-insensitive
+			{`C:\Users\LEVIATHAN`, `c:\users\leviathan`, true},
+			{`C:\Users\LEVIATHAN2\a.pdf`, `C:\Users\LEVIATHAN`, false},
+			{`C:\foobar\x`, `C:\foo`, false},
+			{`C:\Windows\win.ini`, `C:\Users\LEVIATHAN`, false},
+			{`C:\Windows\win.ini`, `D:\`, false},
+		}...)
+	} else {
+		cases = append(cases, []struct {
+			child, parent string
+			want          bool
+		}{
+			{"/home/x/a.pdf", "/", true},
+			{"/A/b", "/a", false}, // case-sensitive outside Windows
+		}...)
 	}
 	for _, tc := range cases {
 		t.Run(tc.child+"|"+tc.parent, func(t *testing.T) {
@@ -206,5 +234,24 @@ func TestOutboundFileName(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestValidateMediaPathAcceptsDriveRoot(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("drive roots are Windows-only")
+	}
+	dir := t.TempDir()
+	file := writeFile(t, dir, "a.pdf", "x")
+	drive := filepath.VolumeName(dir) + `\`
+	t.Setenv("WHATSAPP_MEDIA_ROOTS", drive+";"+strings.ToLower(dir))
+	roots, err := resolveMediaRoots()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range roots {
+		if _, err := validateMediaPath(file, []string{root}); err != nil {
+			t.Fatalf("file under root %q rejected: %v", root, err)
+		}
 	}
 }

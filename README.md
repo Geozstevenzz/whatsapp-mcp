@@ -565,7 +565,10 @@ to the matching value.
 Outbound `media_path` values are confined to `WHATSAPP_MEDIA_ROOTS`. The default
 outbox is `~/.local/share/whatsapp-mcp/outbox`, created on bridge startup. Move
 files there before calling `send_file` or `send_audio_message`, or set
-`WHATSAPP_MEDIA_ROOTS` to a colon-separated list of absolute directories.
+`WHATSAPP_MEDIA_ROOTS` to a colon-separated list of absolute directories
+(semicolon-separated on Windows, for example `C:\Users\me;D:\`). A drive or
+filesystem root allows everything below it, and Windows paths match
+case-insensitively.
 
 This fork also exposes `POST /api/poll` (`recipient`, `question`, `options`,
 `multiple`), `POST /api/create_group` (`name`, `participants`) and

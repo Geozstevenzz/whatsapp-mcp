@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -130,16 +131,25 @@ func validateMediaPath(mediaPath string, allowedRoots []string) (string, error) 
 // pathHasPrefix returns true when child is the same path as parent, or a
 // strict descendant. Plain string-prefix matching is unsafe ("/foo/bar"
 // would match "/foo/barbaz"), so we require either exact match or an
-// explicit separator after parent.
+// explicit separator after parent. A parent that already ends in a
+// separator (a filesystem root such as "/" or `D:\`) supplies that
+// separator itself. Windows paths are case-insensitive, so the comparison is
+// too on Windows.
 func pathHasPrefix(child, parent string) bool {
+	if runtime.GOOS == "windows" {
+		child, parent = strings.ToLower(child), strings.ToLower(parent)
+	}
 	if child == parent {
 		return true
 	}
-	if !strings.HasPrefix(child, parent) {
+	if parent == "" || !strings.HasPrefix(child, parent) {
 		return false
 	}
-	rest := child[len(parent):]
-	return strings.HasPrefix(rest, string(os.PathSeparator))
+	sep := string(os.PathSeparator)
+	if strings.HasSuffix(parent, sep) {
+		return true
+	}
+	return strings.HasPrefix(child[len(parent):], sep)
 }
 
 // outboundFileName returns the name a RECIPIENT should see for an outbound
