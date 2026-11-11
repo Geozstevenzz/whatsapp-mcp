@@ -98,6 +98,7 @@ func TestConnectionSuccessClearsQRCode(t *testing.T) {
 	}
 }
 func TestConnectionEndpointsRequireAuthAndStayAvailableBeforePairing(t *testing.T) {
+	t.Setenv(requireTokenEnv, "1") // tokenless calls are allowed outside strict mode
 	c, codes, _ := pairingFixture(t)
 	mux := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, "test-token", nil, c)
 	for _, test := range []struct {

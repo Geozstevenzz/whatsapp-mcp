@@ -2642,6 +2642,7 @@ func TestReactHandler_GroupReactionInvalidSenderJID_Returns400(t *testing.T) {
 // rejects requests that do not carry a valid bearer token.
 func TestReactHandler_NoAuth_Returns401(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
+	t.Setenv(requireTokenEnv, "1") // tokenless calls are allowed outside strict mode
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/react",
@@ -2720,6 +2721,7 @@ func TestMarkReadHandler_Disconnected_Returns503(t *testing.T) {
 
 func TestMarkReadHandler_NoAuth_Returns401(t *testing.T) {
 	const token = "supersecrettoken1234567890abcdef"
+	t.Setenv(requireTokenEnv, "1") // tokenless calls are allowed outside strict mode
 	handler := newRESTMux(newTestClient(&mockLIDStore{}), newTestMessageStore(t), 8080, token, nil)
 
 	req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/mark-read",

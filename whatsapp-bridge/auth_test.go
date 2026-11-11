@@ -56,7 +56,8 @@ func TestHostAllowed(t *testing.T) {
 	}
 }
 
-func TestWithAuthRejectsMissingToken(t *testing.T) {
+func TestWithAuthRejectsMissingTokenInStrictMode(t *testing.T) {
+	t.Setenv(requireTokenEnv, "1")
 	const token = "supersecrettoken1234567890abcdef"
 	allowed := buildAllowedHosts(8080)
 	called := false
@@ -137,5 +138,56 @@ func TestLoadOrCreateBridgeTokenRejectsShortEnv(t *testing.T) {
 	t.Setenv("WHATSAPP_BRIDGE_TOKEN", "tooShort")
 	if _, _, err := loadOrCreateBridgeToken(); err == nil {
 		t.Fatal("expected error for too-short token, got nil")
+	}
+}
+
+func TestWithAuthCompatibilityMatrix(t *testing.T) {
+	const token = "supersecrettoken1234567890abcdef"
+	cases := []struct {
+		name    string
+		strict  bool
+		host    string
+		headers map[string]string
+		want    int
+	}{
+		{"no auth, plain local caller", false, "127.0.0.1:8080", nil, http.StatusOK},
+		{"no auth, localhost host", false, "localhost:8080", nil, http.StatusOK},
+		{"no auth, bad host", false, "evil.example.com", nil, http.StatusForbidden},
+		{"no auth, Origin present", false, "127.0.0.1:8080", map[string]string{"Origin": "https://evil.example.com"}, http.StatusForbidden},
+		{"no auth, Origin null", false, "127.0.0.1:8080", map[string]string{"Origin": "null"}, http.StatusForbidden},
+		{"no auth, Sec-Fetch-Site cross-site", false, "127.0.0.1:8080", map[string]string{"Sec-Fetch-Site": "cross-site"}, http.StatusForbidden},
+		{"no auth, Sec-Fetch-Site same-site", false, "127.0.0.1:8080", map[string]string{"Sec-Fetch-Site": "same-site"}, http.StatusForbidden},
+		{"no auth, Sec-Fetch-Site none", false, "127.0.0.1:8080", map[string]string{"Sec-Fetch-Site": "none"}, http.StatusOK},
+		{"no auth, Sec-Fetch-Site same-origin", false, "127.0.0.1:8080", map[string]string{"Sec-Fetch-Site": "same-origin"}, http.StatusOK},
+		{"valid token", false, "127.0.0.1:8080", map[string]string{"Authorization": "Bearer " + token}, http.StatusOK},
+		{"valid token with Origin", false, "127.0.0.1:8080", map[string]string{"Authorization": "Bearer " + token, "Origin": "http://127.0.0.1:8080"}, http.StatusOK},
+		{"wrong token", false, "127.0.0.1:8080", map[string]string{"Authorization": "Bearer wrongwrongwrongwrongwrongwrong12"}, http.StatusUnauthorized},
+		{"malformed auth header", false, "127.0.0.1:8080", map[string]string{"Authorization": "Basic abc"}, http.StatusUnauthorized},
+		{"empty auth header", false, "127.0.0.1:8080", map[string]string{"Authorization": ""}, http.StatusUnauthorized},
+		{"strict, no auth", true, "127.0.0.1:8080", nil, http.StatusUnauthorized},
+		{"strict, valid token", true, "127.0.0.1:8080", map[string]string{"Authorization": "Bearer " + token}, http.StatusOK},
+		{"strict, bad host", true, "evil.example.com", map[string]string{"Authorization": "Bearer " + token}, http.StatusForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.strict {
+				t.Setenv(requireTokenEnv, "1")
+			} else {
+				t.Setenv(requireTokenEnv, "")
+			}
+			handler := withAuth(token, buildAllowedHosts(8080), func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1:8080/api/send", nil)
+			req.Host = tc.host
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			rec := httptest.NewRecorder()
+			handler(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("got %d, want %d", rec.Code, tc.want)
+			}
+		})
 	}
 }

@@ -487,6 +487,7 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
 | `WHATSAPP_BRIDGE_TOKEN` | generated next to `WHATSMEOW_DB_PATH` as `.bridge-token` | Bearer token for bridge REST calls; also signed onto outbound webhook POSTs |
+| `WHATSAPP_BRIDGE_REQUIRE_TOKEN` | `false` | Fork-specific. `1` requires the bearer token on every REST request (upstream behavior) |
 | `WHATSAPP_HUB_URL` | `http://localhost:8767/ui/whatsapp` | AutoHub status/pairing page opened by macOS bridge notifications |
 | `WHATSAPP_MEDIA_ROOTS` | `~/.local/share/whatsapp-mcp/outbox`     | Path-list of directories allowed for outbound media files |
 | `WHATSAPP_DEVICE_NAME` | `whatsmeow` (whatsmeow default)          | Label shown for this connection under WhatsApp > Linked Devices. Set to a recognisable name. Applies at pair time only (re-pair to change) |
@@ -520,8 +521,8 @@ recommended choice for remote connections; `sse` is kept for older clients.
 
 ### Bridge authentication and media paths
 
-The bridge requires bearer-token authentication for every `/api/*` request and
-accepts only exact loopback Host headers for its configured port. This protects
+The bridge uses bearer-token authentication for `/api/*` requests (see the
+fork-specific compatibility mode below) and accepts only exact loopback Host headers for its configured port. This protects
 the local REST API from other local processes and browser DNS-rebinding attacks.
 
 On first start, the bridge generates a 256-bit token, writes it to
@@ -531,6 +532,15 @@ permissions, and prints a setup banner. The MCP server reads
 directory as `WHATSMEOW_DB_PATH`. For split deployments, containers, or process
 managers that do not share the store directory, set the same
 `WHATSAPP_BRIDGE_TOKEN` value for both the bridge and MCP server.
+
+Fork-specific compatibility mode: this fork accepts a request that has no
+`Authorization` header, so existing local scripts that call the API with plain
+curl keep working. Such a request is rejected with 403 when it carries an
+`Origin` header, or a `Sec-Fetch-Site` header other than `none` or
+`same-origin`, which stops web pages from forging calls. The Host allow-list
+still applies. A request that sends an `Authorization` header must carry the
+correct token or it gets 401. Set `WHATSAPP_BRIDGE_REQUIRE_TOKEN=1` to restore
+the upstream behavior and require the token on every request.
 
 The bridge also signs its **outbound** webhook POSTs (to `WEBHOOK_URL`) with this
 same token, sent as an `X-Bridge-Token: <token>` header — a dedicated header

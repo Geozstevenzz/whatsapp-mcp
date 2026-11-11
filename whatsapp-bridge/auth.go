@@ -8,8 +8,10 @@ package main
 //
 //  1. Bearer-token auth. A 256-bit token is generated at first start and
 //     stored at store/.bridge-token (mode 0600). The MCP server reads it
-//     either from WHATSAPP_BRIDGE_TOKEN or by reading that file. Every
-//     /api/* request must carry "Authorization: Bearer <token>".
+//     either from WHATSAPP_BRIDGE_TOKEN or by reading that file. Requests
+//     carry "Authorization: Bearer <token>". This fork lets tokenless
+//     non-browser requests through unless WHATSAPP_BRIDGE_REQUIRE_TOKEN is
+//     set; see tokenRequired.
 //
 //  2. Host header allow-list. Even with auth, an attacker who tricks a
 //     browser into resolving evil.example.com to 127.0.0.1 (DNS rebinding)
@@ -110,15 +112,56 @@ func printTokenBanner(token string, port int) {
 	fmt.Println()
 }
 
+// requireTokenEnv restores upstream's strict mode, where every request must
+// carry the bearer token.
+const requireTokenEnv = "WHATSAPP_BRIDGE_REQUIRE_TOKEN"
+
+// Fork-local compatibility mode (default): local cron jobs and scripts call
+// the API with plain curl and no token. A request WITHOUT an Authorization
+// header is allowed unless it carries browser fetch metadata that marks it as
+// cross-site, so a web page cannot forge calls. A request that sends an
+// Authorization header must still carry the valid token. Set
+// WHATSAPP_BRIDGE_REQUIRE_TOKEN=1 to require the token on every request.
+func tokenRequired() bool {
+	return getEnvBool(requireTokenEnv, false)
+}
+
+// looksLikeBrowserCrossSite reports whether a request carries browser
+// metadata that tokenless local callers (curl, Python, Node) never send:
+// any Origin header, or Sec-Fetch-Site other than "none" (typed URL or
+// bookmark) or "same-origin".
+func looksLikeBrowserCrossSite(r *http.Request) bool {
+	if _, ok := r.Header["Origin"]; ok {
+		return true
+	}
+	if site, ok := r.Header["Sec-Fetch-Site"]; ok {
+		v := ""
+		if len(site) > 0 {
+			v = strings.ToLower(strings.TrimSpace(site[0]))
+		}
+		return v != "none" && v != "same-origin"
+	}
+	return false
+}
+
 // withAuth wraps an http.HandlerFunc with bearer-token + Host validation.
 // The set of accepted Host values is computed once at server start; we pass
 // it in instead of recomputing per request.
 func withAuth(token string, allowedHosts map[string]struct{}, h http.HandlerFunc) http.HandlerFunc {
+	strict := tokenRequired()
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !hostAllowed(r.Host, allowedHosts) {
 			// 403 — request reached us with a Host we don't recognise.
 			// Likely a DNS-rebinding attempt or misconfigured proxy.
 			http.Error(w, "Forbidden: host not allowed", http.StatusForbidden)
+			return
+		}
+		if _, hasAuth := r.Header["Authorization"]; !hasAuth && !strict {
+			if looksLikeBrowserCrossSite(r) {
+				http.Error(w, "Forbidden: cross-site request without token", http.StatusForbidden)
+				return
+			}
+			h(w, r)
 			return
 		}
 		if !checkBearerToken(r.Header.Get("Authorization"), token) {
