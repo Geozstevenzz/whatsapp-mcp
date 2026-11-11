@@ -557,6 +557,12 @@ outbox is `~/.local/share/whatsapp-mcp/outbox`, created on bridge startup. Move
 files there before calling `send_file` or `send_audio_message`, or set
 `WHATSAPP_MEDIA_ROOTS` to a colon-separated list of absolute directories.
 
+This fork also exposes `POST /api/poll` (`recipient`, `question`, `options`,
+`multiple`), `POST /api/create_group` (`name`, `participants`) and
+`POST /api/set_group_photo` (`group_jid`, `photo_path`). `photo_path` must be a
+JPEG inside `WHATSAPP_MEDIA_ROOTS`. All three return 503 while WhatsApp is not
+connected.
+
 ### Connection status and phone linking
 
 The authenticated bridge API remains available before linking:
